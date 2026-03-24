@@ -143,11 +143,12 @@ class DuckDBSampledValidator:
     MAX_EMPTY_RATE = 10.0       # 10% max empty content
     # Missing URLs = instant fail (no rate threshold needed)
     MIN_JOB_MATCH_RATE = 95.0   # 95% min job content match rate
-    MIN_SCRAPER_SUCCESS = 70.0  # 70% min scraper success rate
+    MIN_SCRAPER_SUCCESS = 80.0  # 80% min scraper success rate
 
     # File size limits - prevent empty file exploit and oversized file OOM
     MIN_FILE_SIZE_BYTES = 15_000                   # 15KB - empty parquet header ≈ 8KB
     MAX_FILE_SIZE_BYTES = 512 * 1024 * 1024        # 512MB - single file cap
+    MIN_BYTES_PER_ROW = 50                         # Legit: 80-1300 B/row. Exploits: 8-25 B/row.
 
     # Scraper validation window — only files uploaded within this window are scraper-validated.
     # Older files rely on credibility from previous validation cycles.
@@ -220,10 +221,11 @@ class DuckDBSampledValidator:
             if not all_files:
                 return self._create_failed_result("No files found")
 
-            # Group files by job, filtering out empty/oversized files
+            # Group files by job, filtering out empty/oversized/suspicious files
             files_by_job = {}
             empty_files_skipped = 0
             oversized_files_skipped = 0
+            low_bpr_files_skipped = 0
             for f in all_files:
                 key = f.get('key', '')
                 if '/job_id=' in key:
@@ -239,6 +241,12 @@ class DuckDBSampledValidator:
                     if filename_rows is not None and filename_rows == 0:
                         empty_files_skipped += 1
                         continue
+                    # Skip suspiciously compressed files (duplicated content compresses to <50 B/row)
+                    if filename_rows is not None and filename_rows > 0:
+                        bpr = file_size / filename_rows
+                        if bpr < self.MIN_BYTES_PER_ROW:
+                            low_bpr_files_skipped += 1
+                            continue
                     job_id = key.split('/job_id=')[1].split('/')[0]
                     if job_id not in files_by_job:
                         files_by_job[job_id] = []
@@ -280,6 +288,11 @@ class DuckDBSampledValidator:
                 bt.logging.warning(
                     f"{miner_hotkey}: {oversized_files_skipped} oversized files skipped "
                     f"(> {self.MAX_FILE_SIZE_BYTES/(1024*1024):.0f}MB)"
+                )
+            if low_bpr_files_skipped > 0:
+                bt.logging.warning(
+                    f"{miner_hotkey}: {low_bpr_files_skipped} suspiciously compressed files skipped "
+                    f"(< {self.MIN_BYTES_PER_ROW} B/row)"
                 )
 
             bt.logging.info(
