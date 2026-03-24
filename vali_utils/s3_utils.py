@@ -27,6 +27,57 @@ from scraping.reddit.model import RedditContent
 from common.data import DataEntity, DataSource
 from common.api_client import TaoSigner
 from vali_utils.parquet_reader import read_random_row_group
+from urllib.parse import urlparse
+
+
+def normalize_url_for_dedup(url_str: str) -> str:
+    """Platform-aware URL normalization that extracts the canonical content ID for dedup.
+
+    Approach: define what a VALID canonical URL looks like, ignore everything else.
+    This is not a blacklist of known exploits — it's a whitelist of valid URL structure.
+
+    X:      Only the numeric tweet ID matters. Username is lowercased (decorative — X resolves by ID).
+    Reddit: Only post_id and comment_id (base36, exactly 7 chars) matter.
+
+    Canonical forms produced:
+      X tweet:        https://x.com/{user_lower}/status/{tweet_id}
+      Reddit post:    https://www.reddit.com/r/{sub}/comments/{post_id}/{slug}
+      Reddit comment: https://www.reddit.com/r/{sub}/comments/{post_id}/{slug}/{comment_id}
+    """
+    url = str(url_str).strip()
+    parsed = urlparse(url)
+    netloc = parsed.netloc.lower()
+    path = parsed.path
+
+    # --- X / Twitter ---
+    if "x.com" in netloc or "twitter.com" in netloc:
+        # Extract /username/status/DIGITS — lowercase username to prevent case-fudging
+        m = re.match(r"^/([^/]+)/status/(\d+)", path)
+        if m:
+            username = m.group(1).lower()
+            tweet_id = m.group(2)
+            return f"https://x.com/{username}/status/{tweet_id}"
+        return f"https://x.com{path.rstrip('/').lower()}"
+
+    # --- Reddit ---
+    if "reddit.com" in netloc:
+        # /r/{sub}/comments/{post_id}/{slug}/{comment_id}
+        m = re.match(
+            r"^/r/([^/]+)/comments/([a-z0-9]+)(?:/([^/]*)(?:/([a-z0-9]+))?)?",
+            path,
+        )
+        if m:
+            sub, post_id, slug, comment_id = m.group(1), m.group(2), m.group(3) or "", m.group(4)
+            # Real Reddit IDs are base36, exactly 7 chars (post and comment).
+            # Verified against 240K+ real comment IDs and 704 post IDs — all 7 chars.
+            # Fake IDs (f1, _f1, aaaaaa0, etc.) fail this check.
+            if comment_id and re.match(r"^[a-z0-9]{7}$", comment_id):
+                return f"https://www.reddit.com/r/{sub}/comments/{post_id}/{slug}/{comment_id}"
+            return f"https://www.reddit.com/r/{sub}/comments/{post_id}/{slug}"
+        return f"https://www.reddit.com{path.rstrip('/')}"
+
+    # --- Fallback: strip query/fragment, lowercase ---
+    return f"{parsed.scheme}://{netloc}{path.rstrip('/')}"
 
 
 @dataclass
@@ -90,6 +141,7 @@ class DuckDBSampledValidator:
     # Validation thresholds
     MAX_DUPLICATE_RATE = 5.0    # 5% max duplicates within same job
     MAX_EMPTY_RATE = 10.0       # 10% max empty content
+    MAX_INVALID_URL_RATE = 5.0  # 5% max non-canonical URLs
     # Missing URLs = instant fail (no rate threshold needed)
     MIN_JOB_MATCH_RATE = 95.0   # 95% min job content match rate
     MIN_SCRAPER_SUCCESS = 70.0  # 70% min scraper success rate
@@ -100,7 +152,7 @@ class DuckDBSampledValidator:
 
     # Scraper validation window — only files uploaded within this window are scraper-validated.
     # Older files rely on credibility from previous validation cycles.
-    SCRAPER_MAX_AGE_HOURS = 6
+    SCRAPER_MAX_AGE_HOURS = 24
 
     # Standard bytes per row for effective_size cap.
     # Real production data: X=77-515 B/row, Reddit=182-1682 B/row.
@@ -108,6 +160,16 @@ class DuckDBSampledValidator:
 
     # Filename pattern: data_YYYYMMDD_HHMMSS_{rowcount}_{hex16}.parquet
     _FILENAME_ROW_COUNT_RE = re.compile(r"^data_\d{8}_\d{6}_(\d+)_[a-f0-9]{16}\.parquet$")
+
+    # Canonical URL patterns — reject URLs that don't match these.
+    # All legit scraper output matches these patterns (verified on production data).
+    _CANONICAL_X = re.compile(r"^https://(x|twitter)\.com/[^/]+/status/\d+$")
+    _CANONICAL_REDDIT_POST = re.compile(
+        r"^https://(www\.)?reddit\.com/r/[^/]+/comments/[a-z0-9]+/[^?#/]*/?$"
+    )
+    _CANONICAL_REDDIT_COMMENT = re.compile(
+        r"^https://(www\.)?reddit\.com/r/[^/]+/comments/[a-z0-9]+/[^/]*/[a-z0-9]{7}/?$"
+    )
 
     # No optional columns — files must match expected schema exactly
     OPTIONAL_COLUMNS: Set[str] = set()
@@ -297,7 +359,7 @@ class DuckDBSampledValidator:
                         f"recent files (uploaded within {self.SCRAPER_MAX_AGE_HOURS}h)..."
                     )
                     scraper_result = await self._perform_scraper_validation(
-                        miner_hotkey, recent_files, expected_jobs, presigned_urls, num_entities=10
+                        miner_hotkey, recent_files, expected_jobs, presigned_urls, num_entities=15
                     )
                 else:
                     bt.logging.info(
@@ -310,6 +372,7 @@ class DuckDBSampledValidator:
             issues = []
             duplicate_rate = duckdb_result["duplicate_rate_within_job"]
             empty_rate = duckdb_result["empty_rate"]
+            invalid_url_rate = duckdb_result.get("invalid_url_rate", 0.0)
             job_match_rate = job_match_result['match_rate']
             scraper_success_rate = scraper_result['success_rate']
             compression_failures = duckdb_result.get("compression_failures", 0)
@@ -323,6 +386,8 @@ class DuckDBSampledValidator:
                 issues.append(f"High duplicates: {duplicate_rate:.1f}%")
             if empty_rate > self.MAX_EMPTY_RATE:
                 issues.append(f"High empty content: {empty_rate:.1f}%")
+            if invalid_url_rate > self.MAX_INVALID_URL_RATE:
+                issues.append(f"Non-canonical URLs: {invalid_url_rate:.1f}% (URL fudging detected)")
             if job_match_rate < self.MIN_JOB_MATCH_RATE:
                 issues.append(f"Low job match: {job_match_rate:.1f}%")
             if scraper_success_rate < self.MIN_SCRAPER_SUCCESS:
@@ -388,6 +453,7 @@ class DuckDBSampledValidator:
                     f"job_match={job_match_rate:.1f}% (min {self.MIN_JOB_MATCH_RATE}%), "
                     f"scraper={scraper_success_rate:.1f}% (min {self.MIN_SCRAPER_SUCCESS}%), "
                     f"compression_fails={compression_failures}, "
+                    f"invalid_urls={invalid_url_rate:.1f}% (max {self.MAX_INVALID_URL_RATE}%), "
                     f"row_count_mismatches={row_count_mismatches}"
                 )
 
@@ -529,6 +595,10 @@ class DuckDBSampledValidator:
         dedup_total = 0
         dedup_duplicates = 0
 
+        # URL format validation: count non-canonical URLs
+        invalid_url_total = 0
+        invalid_url_count = 0
+
         # Limit to 20 files max for checks
         files_to_check = random.sample(sampled_files, min(20, len(sampled_files)))
 
@@ -631,13 +701,32 @@ class DuckDBSampledValidator:
                 url_rows = conn.execute(
                     f"SELECT url FROM read_parquet('{presigned_url}')"
                 ).fetchall()
+
+                # Pick the right canonical pattern for this platform
+                if platform in ['x', 'twitter']:
+                    canon_re = self._CANONICAL_X
+                else:
+                    canon_post_re = self._CANONICAL_REDDIT_POST
+                    canon_comment_re = self._CANONICAL_REDDIT_COMMENT
+
                 for (url_val,) in url_rows:
-                    h = hashlib.blake2b(str(url_val).encode(), digest_size=8).digest()
+                    url_str = str(url_val)
+                    normalized = normalize_url_for_dedup(url_str)
+                    h = hashlib.blake2b(normalized.encode(), digest_size=8).digest()
                     dedup_total += 1
                     if h in job_hashes:
                         dedup_duplicates += 1
                     else:
                         job_hashes.add(h)
+
+                    # URL format validation — reject non-canonical URLs
+                    invalid_url_total += 1
+                    if platform in ['x', 'twitter']:
+                        if not canon_re.match(url_str):
+                            invalid_url_count += 1
+                    else:
+                        if not canon_post_re.match(url_str) and not canon_comment_re.match(url_str):
+                            invalid_url_count += 1
 
                 # --- PyArrow row-group read for empty/missing content check ---
                 if platform in ['x', 'twitter']:
@@ -708,11 +797,20 @@ class DuckDBSampledValidator:
                 f"({dedup_duplicates}/{dedup_total} urls across {len(dedup_hashes_by_job)} jobs)"
             )
 
+        # Invalid URL format rate
+        invalid_url_rate = (invalid_url_count / invalid_url_total * 100) if invalid_url_total > 0 else 0.0
+        if invalid_url_rate > self.MAX_INVALID_URL_RATE:
+            bt.logging.warning(
+                f"Non-canonical URLs: {invalid_url_rate:.1f}% "
+                f"({invalid_url_count}/{invalid_url_total} urls have fudged/invalid format)"
+            )
+
         if total_rows == 0:
             return {
                 "success": True,
                 "duplicate_rate_within_job": duplicate_rate,
                 "empty_rate": 0.0,
+                "invalid_url_rate": invalid_url_rate,
                 "total_rows": 0,
                 "compression_failures": compression_failures,
                 "row_count_mismatches": row_count_mismatches,
@@ -723,13 +821,15 @@ class DuckDBSampledValidator:
         bt.logging.info(
             f"Sampled validation: {total_rows} rows, "
             f"dup={duplicate_rate:.1f}% (per-job, {len(dedup_hashes_by_job)} jobs), "
-            f"empty={empty_rate:.1f}%, compression_fails={compression_failures}"
+            f"empty={empty_rate:.1f}%, invalid_urls={invalid_url_rate:.1f}%, "
+            f"compression_fails={compression_failures}"
         )
 
         return {
             "success": True,
             "duplicate_rate_within_job": duplicate_rate,
             "empty_rate": empty_rate,
+            "invalid_url_rate": invalid_url_rate,
             "total_rows": total_rows,
             "compression_failures": compression_failures,
             "row_count_mismatches": row_count_mismatches,
