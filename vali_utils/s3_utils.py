@@ -293,8 +293,12 @@ class DuckDBSampledValidator:
                 )
             if low_bpr_files_skipped > 0:
                 bt.logging.warning(
-                    f"{miner_hotkey}: {low_bpr_files_skipped} suspiciously compressed files skipped "
+                    f"{miner_hotkey}: {low_bpr_files_skipped} suspiciously compressed files detected "
                     f"(< {self.MIN_BYTES_PER_ROW} B/row)"
+                )
+                return self._create_failed_result(
+                    f"{low_bpr_files_skipped} files with suspiciously low bytes/row "
+                    f"(< {self.MIN_BYTES_PER_ROW} B/row — likely duplicated content)"
                 )
 
             bt.logging.info(
