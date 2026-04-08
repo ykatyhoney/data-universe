@@ -400,22 +400,15 @@ class MinerScorer:
             )
 
     def apply_ondemand_penalty(self, uid: int, mult_factor: float):
-        """Applies a credibility penalty to a given miner based on their ondemand result"""
+        """Applies an OD-only penalty: decays boost and OD credibility.
+
+        Does NOT touch P2P credibility — OD failures should not contaminate
+        P2P scoring. The composite score is recalculated after the update.
+        """
         with self.lock:
-            cred_penalty = MinerScorer.ONDEMAND_MAX_CRED_PENALTY * mult_factor
-            old_cred = float(self.miner_credibility[uid])
-
-            # Apply credibility penalty
-            self.miner_credibility[uid] = max(self.miner_credibility[uid] - cred_penalty, 0)
-            new_cred = float(self.miner_credibility[uid])
-
             # EMA the ondemand boost with 0 reward for failures
             old_boost = float(self.ondemand_boosts[uid])
-            failure_reward = 0
-            self.ondemand_boosts[uid] = (
-                self.ondemand_alpha * failure_reward +
-                (1 - self.ondemand_alpha) * self.ondemand_boosts[uid]
-            )
+            self.ondemand_boosts[uid] = (1 - self.ondemand_alpha) * self.ondemand_boosts[uid]
             new_boost = float(self.ondemand_boosts[uid])
 
             # Direct penalty to on-demand credibility for bad data
@@ -425,36 +418,10 @@ class MinerScorer:
             )
             new_od_cred = float(self.ondemand_credibility[uid])
 
-            # Recalculate composite score with updated credibilities
-            old_score = float(self.scores[uid])
-            p2p_raw = float(self.scorable_bytes[uid])
-            p2p_component = p2p_raw * MinerScorer.P2P_REWARD_SCALE * (new_cred ** MinerScorer._CREDIBILITY_EXP)
-            s3_component = float(self.s3_boosts[uid]) * (float(self.s3_credibility[uid]) ** MinerScorer._CREDIBILITY_EXP)
-            # OD: no exponent — raw credibility, same as on_miner_evaluated and get_scores_for_weights
-            od_component = float(self.ondemand_boosts[uid]) * new_od_cred
-
-            # TEMPORARY: S3 capped at 2x on-demand component.
-            # Prevents fabricators from profiting purely off S3 volume.
-            # Legit miners with real OD participation still get rewarded for S3.
-            # Will be replaced by proper incentive redesign.
-            s3_uncapped = s3_component
-            if od_component > 0:
-                s3_component = min(s3_component, od_component * 2)
-            else:
-                s3_component = 0.0
-
-            self.scores[uid] = p2p_component + s3_component + od_component
-
             bt.logging.info(
                 f"OnDemand penalty for Miner {uid}: "
-                f"P2P Cred {old_cred:.4f} -> {new_cred:.4f}, "
-                f"OnDemand Cred {old_od_cred:.4f} -> {new_od_cred:.4f}, "
-                f"Boost {old_boost:.2f} -> {new_boost:.2f}, "
-                f"P2P={p2p_component:.0f} (raw={float(self.scorable_bytes[uid]):.0f}, cred={float(self.miner_credibility[uid]):.4f}), "
-                f"S3={s3_component:.0f} (boost={float(self.s3_boosts[uid]):.0f}, cred={float(self.s3_credibility[uid]):.4f})"
-                f"{f', capped from {s3_uncapped:.0f}' if s3_uncapped != s3_component else ''}, "
-                f"OD={od_component:.0f} (boost={float(self.ondemand_boosts[uid]):.0f}, cred={new_od_cred:.4f}), "
-                f"Score {old_score:.2f} -> {float(self.scores[uid]):.2f}"
+                f"OD Cred {old_od_cred:.4f} -> {new_od_cred:.4f}, "
+                f"Boost {old_boost:.0f} -> {new_boost:.0f}"
             )
 
     def apply_ondemand_reward(
