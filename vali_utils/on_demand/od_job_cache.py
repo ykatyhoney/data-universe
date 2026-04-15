@@ -62,7 +62,7 @@ class ODJobCache:
                 for jid in to_remove:
                     self._processed_jobs.discard(jid)
 
-            bt.logging.trace(
+            bt.logging.debug(
                 f"ODJobCache: cached {len(results)} miner results for job {job_id}"
             )
 
@@ -81,7 +81,7 @@ class ODJobCache:
         with self._lock:
             results = self._results.pop(hotkey, [])
             if results:
-                bt.logging.trace(
+                bt.logging.debug(
                     f"ODJobCache: drained {len(results)} results for {hotkey[:16]}..."
                 )
             return results

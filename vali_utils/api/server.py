@@ -179,7 +179,7 @@ class ValidatorAPI:
         def run_server():
             try:
                 bt.logging.info(f"Starting API server on port {self.port}")
-                uvicorn.run(self.app, host="0.0.0.0", port=self.port, log_level="info")
+                uvicorn.run(self.app, host="0.0.0.0", port=self.port, log_level="warning")
             except Exception as e:
                 bt.logging.error(f"API server error: {str(e)}")
 

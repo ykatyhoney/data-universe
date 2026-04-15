@@ -644,36 +644,16 @@ class OnDemandValidator:
             ).total_seconds()
             decay_rate = 0.05
             speed_multiplier = max(0.1, math.exp(-decay_rate * upload_time_seconds))
-            bt.logging.trace(
-                f"Upload time: {upload_time_seconds:.0f}s "
-                f"-> speed multiplier (exponential): {speed_multiplier:.3f}"
-            )
 
         # Volume multiplier
         if requested_limit is None:
             if consensus_count and consensus_count > 0:
                 volume_multiplier = min(1.0, returned_count / consensus_count)
-                bt.logging.trace(
-                    f"Returned {returned_count} rows vs consensus {consensus_count:.0f} (no limit) "
-                    f"-> volume multiplier: {volume_multiplier:.3f}"
-                )
             else:
                 volume_multiplier = 1.0
-                bt.logging.trace(
-                    f"Returned {returned_count} rows (no limit, no consensus) "
-                    f"-> volume multiplier: {volume_multiplier:.3f}"
-                )
         elif returned_count == 0:
             volume_multiplier = 0.0
-            bt.logging.trace(
-                f"Returned {returned_count}/{requested_limit} rows "
-                f"-> volume multiplier: {volume_multiplier:.3f}"
-            )
         else:
             volume_multiplier = min(1.0, returned_count / requested_limit)
-            bt.logging.trace(
-                f"Returned {returned_count}/{requested_limit} rows "
-                f"-> volume multiplier: {volume_multiplier:.3f}"
-            )
 
         return speed_multiplier, volume_multiplier
