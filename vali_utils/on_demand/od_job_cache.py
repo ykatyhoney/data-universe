@@ -17,7 +17,6 @@ class CachedMinerODResult:
     speed_multiplier: float
     volume_multiplier: float
     failure_reason: Optional[str] = None
-    s3_presigned_url: Optional[str] = None  # stored at poll time so evaluator can download directly
 
 
 class ODJobCache:
