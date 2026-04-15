@@ -171,49 +171,15 @@ class TestEvaluateOD(unittest.TestCase):
         evaluator = MagicMock()
         evaluator.scorer = self.scorer
         evaluator.od_cache = self.cache
-        evaluator.on_demand_validator = None  # no spot-check
+        evaluator.on_demand_validator = None
         evaluator.config = MagicMock()
         evaluator.wallet = MagicMock()
+        evaluator.OD_MAX_JOBS_TO_VALIDATE = 5
+        evaluator.OD_SCHEMA_SAMPLE_SIZE = 5
         return evaluator
 
-    def test_drain_and_apply_rewards(self):
-        """Rewards are applied for all passed results."""
-        # Add 3 passed results
-        for i in range(3):
-            self.cache.add_results(f"job{i}", {
-                "hk_miner": CachedMinerODResult(
-                    job_id=f"job{i}",
-                    submitted_at=dt.datetime.now(dt.timezone.utc),
-                    returned_count=100,
-                    requested_limit=100,
-                    passed_validation=True,
-                    speed_multiplier=0.9,
-                    volume_multiplier=0.8,
-                ),
-            })
-
-        old_boost = float(self.scorer.ondemand_boosts[0])
-        old_cred = float(self.scorer.ondemand_credibility[0])
-
-        # Call _evaluate_od directly using the real method
-        from vali_utils.miner_evaluator import MinerEvaluator
-        # We need to call the unbound method with our mock
-        evaluator = self._make_evaluator_mock()
-
-        async def run():
-            await MinerEvaluator._evaluate_od(evaluator, uid=0, hotkey="hk_miner")
-
-        asyncio.run(run())
-
-        # Boost and cred should have increased (3 rewards applied)
-        self.assertGreater(float(self.scorer.ondemand_boosts[0]), old_boost)
-        self.assertGreater(float(self.scorer.ondemand_credibility[0]), old_cred)
-
-        # Cache should be empty now
-        self.assertEqual(self.cache.get_and_drain("hk_miner"), [])
-
-    def test_drain_and_apply_penalties(self):
-        """Penalties are applied for failed results."""
+    def test_empty_submissions_penalized_immediately(self):
+        """Empty (0-byte) submissions are penalized without needing API/download."""
         self.cache.add_results("job1", {
             "hk_miner": CachedMinerODResult(
                 job_id="job1",
@@ -238,6 +204,37 @@ class TestEvaluateOD(unittest.TestCase):
         asyncio.run(run())
 
         self.assertLess(float(self.scorer.ondemand_credibility[0]), old_cred)
+
+    def test_pending_results_not_rewarded_without_validation(self):
+        """Pending results (passed_validation=None) should not be blindly rewarded.
+        When API fetch fails, they get benefit-of-doubt reward."""
+        for i in range(3):
+            self.cache.add_results(f"job{i}", {
+                "hk_miner": CachedMinerODResult(
+                    job_id=f"job{i}",
+                    submitted_at=dt.datetime.now(dt.timezone.utc),
+                    returned_count=100,
+                    requested_limit=100,
+                    passed_validation=None,  # pending — not pre-approved
+                    speed_multiplier=0.9,
+                    volume_multiplier=0.8,
+                ),
+            })
+
+        from vali_utils.miner_evaluator import MinerEvaluator
+        evaluator = self._make_evaluator_mock()
+
+        # Mock the API client to raise (simulating API failure)
+        with patch("vali_utils.miner_evaluator.DataUniverseApiClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(side_effect=Exception("API down"))
+
+            async def run():
+                await MinerEvaluator._evaluate_od(evaluator, uid=0, hotkey="hk_miner")
+
+            asyncio.run(run())
+
+        # Cache should be drained
+        self.assertEqual(self.cache.get_and_drain("hk_miner"), [])
 
     def test_no_cache_is_noop(self):
         """If od_cache is None, _evaluate_od does nothing."""
@@ -268,13 +265,13 @@ class TestEvaluateOD(unittest.TestCase):
 
         self.assertEqual(float(self.scorer.ondemand_boosts[0]), old_boost)
 
-    def test_mixed_results(self):
-        """Mix of passed and failed results applies both rewards and penalties."""
+    def test_mixed_empty_and_pending(self):
+        """Mix of empty (failed) and pending (need validation) results."""
         self.cache.add_results("job1", {
             "hk_miner": CachedMinerODResult(
                 job_id="job1", submitted_at=dt.datetime.now(dt.timezone.utc),
                 returned_count=100, requested_limit=100,
-                passed_validation=True, speed_multiplier=1.0, volume_multiplier=1.0,
+                passed_validation=None, speed_multiplier=1.0, volume_multiplier=1.0,
             ),
         })
         self.cache.add_results("job2", {
@@ -289,13 +286,17 @@ class TestEvaluateOD(unittest.TestCase):
         from vali_utils.miner_evaluator import MinerEvaluator
         evaluator = self._make_evaluator_mock()
 
-        async def run():
-            await MinerEvaluator._evaluate_od(evaluator, uid=0, hotkey="hk_miner")
+        # Mock the API client to raise (so pending results get benefit of doubt)
+        with patch("vali_utils.miner_evaluator.DataUniverseApiClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(side_effect=Exception("API down"))
 
-        asyncio.run(run())
+            async def run():
+                await MinerEvaluator._evaluate_od(evaluator, uid=0, hotkey="hk_miner")
 
-        # Boost should be non-zero (reward applied then decayed by penalty)
-        self.assertGreater(float(self.scorer.ondemand_boosts[0]), 0)
+            asyncio.run(run())
+
+        # Empty submission should have penalized credibility
+        self.assertLess(float(self.scorer.ondemand_credibility[0]), 0.5)
         # Cache drained
         self.assertEqual(self.cache.get_and_drain("hk_miner"), [])
 

@@ -154,7 +154,7 @@ class DuckDBSampledValidator:
 
     # Scraper validation window — only files uploaded within this window are scraper-validated.
     # Older files rely on credibility from previous validation cycles.
-    SCRAPER_MAX_AGE_HOURS = 72
+    SCRAPER_MAX_AGE_HOURS = 96
 
     # Standard bytes per row for effective_size cap.
     # Real production data: X=77-515 B/row, Reddit=182-1682 B/row.
@@ -308,7 +308,8 @@ class DuckDBSampledValidator:
                 f"{job_coverage_rate:.1f}% coverage"
             )
 
-            # Step 2: Random sample files from active jobs
+            # Step 2: Sample files from active jobs — size-weighted to ensure big files
+            # (which drive effective_size) are always represented in validation.
             active_files = []
             for job_id in active_job_ids:
                 active_files.extend([(f, job_id) for f in files_by_job[job_id]])
@@ -319,10 +320,27 @@ class DuckDBSampledValidator:
             sample_count = max(10, int(len(active_files) * self.sample_percent / 100))
             sample_count = min(sample_count, len(active_files), 200)  # Cap at 200 files max
 
-            sampled_files_with_job = random.sample(active_files, sample_count)
+            # Split into big (>1MB) and small files — guarantee big files are sampled
+            # since they carry the vast majority of rows/effective_size
+            big_files = [(f, j) for f, j in active_files if f.get('size', 0) > 1_000_000]
+            small_files = [(f, j) for f, j in active_files if f.get('size', 0) <= 1_000_000]
+
+            # Reserve half the sample for big files (if available)
+            big_sample_count = min(len(big_files), sample_count // 2)
+            small_sample_count = min(len(small_files), sample_count - big_sample_count)
+            # Fill remaining slots from the other pool
+            big_sample_count = min(len(big_files), sample_count - small_sample_count)
+
+            sampled_big = random.sample(big_files, big_sample_count) if big_sample_count > 0 else []
+            sampled_small = random.sample(small_files, small_sample_count) if small_sample_count > 0 else []
+            sampled_files_with_job = sampled_big + sampled_small
+            random.shuffle(sampled_files_with_job)
             sampled_files = [f for f, _ in sampled_files_with_job]
 
-            bt.logging.info(f"{miner_hotkey}: Sampled {len(sampled_files)} files ({self.sample_percent}%)")
+            bt.logging.info(
+                f"{miner_hotkey}: Sampled {len(sampled_files)} files "
+                f"({len(sampled_big)} big + {len(sampled_small)} small)"
+            )
 
             # Step 3: Get presigned URLs for sample
             file_keys = [f['key'] for f in sampled_files]
@@ -349,9 +367,12 @@ class DuckDBSampledValidator:
                     sampled_files, expected_jobs, presigned_urls
                 )
 
-                # Step 6: Scraper validation — only on recently uploaded files
+                # Step 6: Scraper validation — mix of recent and older files.
+                # Validating only recent files allowed miners to upload small correct
+                # files recently while bulk fabricated data (older) was never checked.
                 cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=self.SCRAPER_MAX_AGE_HOURS)
                 recent_files = []
+                older_files = []
                 for f in sampled_files:
                     last_mod = f.get('last_modified', '')
                     if last_mod:
@@ -359,21 +380,31 @@ class DuckDBSampledValidator:
                             file_dt = pd.to_datetime(last_mod, utc=True).to_pydatetime()
                             if file_dt >= cutoff:
                                 recent_files.append(f)
+                            else:
+                                older_files.append(f)
                         except Exception:
-                            pass
+                            older_files.append(f)
+                    else:
+                        older_files.append(f)
 
-                if recent_files:
+                # Always include some older files in scraper validation so old data can't hide
+                scraper_files = list(recent_files)
+                if older_files:
+                    older_sample = random.sample(older_files, min(len(older_files), max(5, len(recent_files))))
+                    scraper_files.extend(older_sample)
+                random.shuffle(scraper_files)
+
+                if scraper_files:
                     bt.logging.info(
-                        f"{miner_hotkey}: Running scraper validation on {len(recent_files)} "
-                        f"recent files (uploaded within {self.SCRAPER_MAX_AGE_HOURS}h)..."
+                        f"{miner_hotkey}: Running scraper validation on {len(scraper_files)} files "
+                        f"({len(recent_files)} recent + {len(scraper_files) - len(recent_files)} older)..."
                     )
                     scraper_result = await self._perform_scraper_validation(
-                        miner_hotkey, recent_files, expected_jobs, presigned_urls, num_entities=15
+                        miner_hotkey, scraper_files, expected_jobs, presigned_urls, num_entities=15
                     )
                 else:
                     bt.logging.info(
-                        f"{miner_hotkey}: No recent files within {self.SCRAPER_MAX_AGE_HOURS}h — "
-                        f"skipping scraper validation (credibility covers older data)"
+                        f"{miner_hotkey}: No files available for scraper validation"
                     )
                     scraper_result = {'entities_validated': 0, 'entities_passed': 0, 'success_rate': None, 'sample_results': []}
 
@@ -607,8 +638,10 @@ class DuckDBSampledValidator:
         unique_content_ids: set = set()
         total_content_id_rows = 0
 
-        # Limit to 20 files max for checks
-        files_to_check = random.sample(sampled_files, min(20, len(sampled_files)))
+        # Scale checks with sample size: 20% of sample, min 20, max 50
+        check_count = max(20, len(sampled_files) // 5)
+        check_count = min(check_count, len(sampled_files), 50)
+        files_to_check = random.sample(sampled_files, check_count)
 
         for file_info in files_to_check:
             if schema_failures > 0:
@@ -697,6 +730,16 @@ class DuckDBSampledValidator:
                 if unexpected_columns:
                     bt.logging.warning(
                         f"Invalid schema: unexpected columns {list(unexpected_columns)[:5]}"
+                    )
+                    schema_failures += 1
+                    break
+
+                # Missing required columns — fabricated files drop columns to dodge checks
+                missing_columns = expected_columns - available_columns
+                if missing_columns:
+                    bt.logging.warning(
+                        f"Invalid schema: missing required columns {sorted(missing_columns)[:10]} "
+                        f"(has {len(available_columns)}/{len(expected_columns)} expected)"
                     )
                     schema_failures += 1
                     break
@@ -983,6 +1026,15 @@ class DuckDBSampledValidator:
                         bt.logging.debug(f"Skipping file with {len(all_column_names)} columns (expected max {max_columns})")
                         continue
 
+                    # Skip files missing required columns (fabricated data)
+                    available_cols = set(all_column_names)
+                    if platform in ['x', 'twitter']:
+                        required = {c.lower() for c in self.EXPECTED_COLUMNS_X}
+                    else:
+                        required = {c.lower() for c in self.EXPECTED_COLUMNS_REDDIT}
+                    if required - available_cols:
+                        continue
+
                     # Read 1 random row group via Range requests (~3MB vs full scan)
                     sample_df = read_random_row_group(
                         presigned_url, file_size,
@@ -1140,6 +1192,15 @@ class DuckDBSampledValidator:
 
                 if len(all_column_names) > max_columns:
                     bt.logging.debug(f"Skipping file with {len(all_column_names)} columns (expected max {max_columns})")
+                    continue
+
+                # Skip files missing required columns (fabricated data)
+                available_cols = set(all_column_names)
+                if platform in ['x', 'twitter']:
+                    required = {c.lower() for c in self.EXPECTED_COLUMNS_X}
+                else:
+                    required = {c.lower() for c in self.EXPECTED_COLUMNS_REDDIT}
+                if required - available_cols:
                     continue
 
                 # Read 1 random row group via Range requests (~3MB vs full scan)

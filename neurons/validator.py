@@ -323,10 +323,9 @@ class Validator:
 
                     submissions = job_with_submission.submissions
 
-                    # No validation / downloading — just record who submitted
-                    # and their speed based on submission timestamp.
-                    # S3 validation already catches data quality issues;
-                    # OD just tracks participation and response speed.
+                    # Cache metadata only — the evaluator will download and
+                    # validate content before rewarding.  The poller only
+                    # records who submitted and how fast.
                     cache_results: Dict[str, CachedMinerODResult] = {}
 
                     for sub in submissions:
@@ -338,7 +337,7 @@ class Validator:
                         except ValueError:
                             continue
 
-                        # Empty submission (0 bytes) → penalize
+                        # Empty submission (0 bytes) → mark as failed
                         is_empty = (sub.s3_content_length or 0) == 0
                         if is_empty:
                             cache_results[hotkey] = CachedMinerODResult(
@@ -358,17 +357,19 @@ class Validator:
                             self.on_demand_validator.calculate_ondemand_reward_multipliers(
                                 job_created_at=job.created_at,
                                 submission_timestamp=sub.submitted_at,
-                                returned_count=job.limit or 100,  # trust they filled the job
+                                returned_count=job.limit or 100,
                                 requested_limit=job.limit,
                             )
                         )
 
+                        # passed_validation=None means "pending — evaluator
+                        # must download and validate before rewarding"
                         cache_results[hotkey] = CachedMinerODResult(
                             job_id=job.id,
                             submitted_at=sub.submitted_at,
                             returned_count=job.limit or 100,
                             requested_limit=job.limit,
-                            passed_validation=True,
+                            passed_validation=None,
                             speed_multiplier=speed_mult,
                             volume_multiplier=volume_mult,
                         )
@@ -376,10 +377,11 @@ class Validator:
                     # Write all results to the shared OD cache
                     self.od_cache.add_results(job.id, cache_results)
 
+                    pending = sum(1 for r in cache_results.values() if r.passed_validation is None)
+                    empty = sum(1 for r in cache_results.values() if r.passed_validation is False)
                     bt.logging.info(
                         f"Job {job.id}: cached {len(cache_results)} submitter results "
-                        f"({sum(1 for r in cache_results.values() if r.passed_validation)} non-empty, "
-                        f"{sum(1 for r in cache_results.values() if not r.passed_validation)} empty)"
+                        f"({pending} pending validation, {empty} empty)"
                     )
             except:
                 bt.logging.exception(

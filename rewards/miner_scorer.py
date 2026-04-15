@@ -23,13 +23,14 @@ class MinerScorer:
     # v5: Full reset — engagement/uniqueness/URL checks reveal widespread exploit
     # v6: Reset S3 — .head() → .sample() fix (scraper sampling bypass)
     # v7: Reset OD — moved scoring to evaluator, dropped ^2.5 exponent, fixed credibility decay
-    STATE_VERSION = 7
+    # v8: Reset S3 — strict schema check catches fabricated data; old inflated scores are invalid
+    STATE_VERSION = 8
 
     # Start new miner's at a credibility of 0.
     STARTING_CREDIBILITY = 0
 
-    # Start new miners' S3 credibility at 0.375
-    STARTING_S3_CREDIBILITY = 0.375
+    # Start new miners' S3 credibility low — must earn it through passing validation
+    STARTING_S3_CREDIBILITY = 0.1
 
     # The exponent used to scale the miner's score by its credibility.
     _CREDIBILITY_EXP = 2.5
@@ -150,6 +151,23 @@ class MinerScorer:
                 bt.logging.warning(
                     f"State migration v{saved_version} -> v7: "
                     f"Full score reset (OD fix changes all weights)."
+                )
+                self.scores.zero_()
+                self.miner_credibility.fill_(MinerScorer.STARTING_CREDIBILITY)
+                self.scorable_bytes.zero_()
+                self.s3_boosts.zero_()
+                self.s3_credibility.fill_(MinerScorer.STARTING_S3_CREDIBILITY)
+                self.effective_sizes.zero_()
+                self.ondemand_boosts.zero_()
+                self.ondemand_credibility.fill_(MinerScorer.STARTING_ONDEMAND_CREDIBILITY)
+
+            if saved_version < 8:
+                # -> v8: Full reset — strict schema check (missing columns = fail)
+                # catches fabricated S3 data; OD was blindly rewarding unvalidated
+                # submissions. Both channels have tainted scores that must be wiped.
+                bt.logging.warning(
+                    f"State migration v{saved_version} -> v8: "
+                    f"Full score reset (strict schema + OD validation fix)."
                 )
                 self.scores.zero_()
                 self.miner_credibility.fill_(MinerScorer.STARTING_CREDIBILITY)
