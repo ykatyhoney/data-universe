@@ -1,0 +1,44 @@
+name: ops-ci
+
+on:
+  push:
+    paths:
+      - "ops/**"
+      - "ecosystem.config.js"
+      - ".github/workflows/ops-ci.yml"
+  pull_request:
+    paths:
+      - "ops/**"
+      - "ecosystem.config.js"
+      - ".github/workflows/ops-ci.yml"
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ops
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ops (with dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff check
+        run: ruff check .
+
+      - name: Ruff format (diff only — no auto-fix in CI)
+        run: ruff format --check .
+
+      - name: Mypy
+        run: mypy shared dashboard datastore normalizer pipeline self_validator scripts
+
+      - name: Pytest (unit only; integration gated on OPS_RUN_INTEGRATION)
+        run: pytest
