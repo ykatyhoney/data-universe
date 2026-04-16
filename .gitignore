@@ -7,6 +7,32 @@ __pycache__/
 .vscode/
 .env
 
+# ops stack local artifacts
+ops/.venv/
+ops/.env
+ops/.pytest_cache/
+ops/.ruff_cache/
+ops/.mypy_cache/
+ops/**/*.egg-info/
+ops/**/dist/
+ops/**/build/
+
+# SQLite ops database + WAL sidecars
+ops/ops.db
+ops/ops.db-wal
+ops/ops.db-shm
+ops/ops.db-journal
+
+# pm2 runtime logs (ecosystem.config.js writes here)
+logs/
+.pm2/
+
+# frontend build artefacts
+ops/dashboard/web/node_modules/
+ops/dashboard/web/dist/
+ops/dashboard/web/.vite/
+ops/dashboard/web/*.tsbuildinfo
+
 # Playground notebooks
 *Playground.ipynb
 
