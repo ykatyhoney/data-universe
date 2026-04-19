@@ -41,11 +41,9 @@ import httpx
 
 from common.api_client import (
     DataUniverseApiClient,
-    ListJobsWithSubmissionsForValidationRequest,
     OnDemandMinerUpload,
 )
 from rewards.miner_scorer import MinerScorer
-from vali_utils.on_demand.od_job_cache import ODJobCache
 from vali_utils.on_demand.on_demand_validation import OnDemandValidator
 
 
@@ -82,12 +80,9 @@ class MinerEvaluator:
         self.storage = SqliteMemoryValidatorStorage()
         self.s3_storage = S3ValidationStorage(self.config.s3_results_path)
         self.s3_reader = s3_reader
-        # OD job cache — set by validator.py after construction.
-        # eval_miner() drains cached OD results per-miner.
-        self.od_cache: Optional[ODJobCache] = None
         # OD validator — set by validator.py after construction.
-        # Used for spot-check validation at eval time.
-        self.on_demand_validator = None
+        # Used for inline OD evaluation during eval_miner().
+        self.on_demand_validator: Optional[OnDemandValidator] = None
 
         # Instantiate runners
         self.should_exit: bool = False
@@ -105,147 +100,23 @@ class MinerEvaluator:
 
     # Maximum OD jobs to validate per miner per eval cycle.
     # Each validation downloads ~1MB + 1 scraper API call, so keep this bounded.
-    OD_MAX_JOBS_TO_VALIDATE = 5
+    OD_MAX_JOBS_TO_VALIDATE = 3
     # Number of entities to schema-check per downloaded submission.
     OD_SCHEMA_SAMPLE_SIZE = 5
 
     async def _evaluate_od(self, uid: int, hotkey: str) -> None:
-        """Drain cached OD results and validate before rewarding.
+        """Evaluate a miner's on-demand submissions by querying the API directly.
 
-        The poller caches metadata only (passed_validation=None for non-empty
-        submissions).  This method downloads a sample of submissions, runs
-        schema + job-match + scraper validation, then rewards or penalizes.
+        Calls the per-miner jobs endpoint to get this miner's recent OD
+        submissions with fresh presigned URLs, then validates a random
+        sample and applies per-job rewards/penalties.
 
-        Results that were already marked False by the poller (empty 0-byte
-        submissions) are penalized immediately without downloading.
+        TODO: implement after new API endpoint is ready.
         """
-        if self.od_cache is None:
-            return
-
-        results = self.od_cache.get_and_drain(hotkey)
-        if not results:
-            return
-
-        # Separate already-failed (empty) from pending (need validation)
-        failed_results = [r for r in results if r.passed_validation is False]
-        pending_results = [r for r in results if r.passed_validation is None]
-
-        # Penalize empty submissions immediately
-        for r in failed_results:
-            self.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
-
-        if not pending_results:
-            bt.logging.info(
-                f"UID:{uid} - HOTKEY:{hotkey}: {len(failed_results)} empty OD submissions penalized, "
-                f"0 pending"
-            )
-            return
-
-        # Pick a sample of pending jobs to validate (download is expensive)
-        jobs_to_validate = random.sample(
-            pending_results,
-            min(self.OD_MAX_JOBS_TO_VALIDATE, len(pending_results)),
-        )
-
         if self.on_demand_validator is None:
-            bt.logging.debug(f"UID:{uid} - OD validation: no validator configured, skipping")
             return
 
-        # Fetch recent jobs from API to get presigned URLs.
-        # Use a wide window (3h) to cover the full eval rotation.
-        jobs_map = {}  # job_id → (job, {hotkey: submission})
-        try:
-            base_url = self.config.s3_auth_url
-            verify_ssl = "localhost" not in base_url
-            async with DataUniverseApiClient(
-                base_url=base_url,
-                verify_ssl=verify_ssl,
-                keypair=self.wallet.hotkey,
-                timeout=60,
-            ) as client:
-                resp = await client.validator_list_jobs_with_submissions(
-                    req=ListJobsWithSubmissionsForValidationRequest(
-                        expired_since=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3),
-                        expired_until=dt.datetime.now(dt.timezone.utc),
-                        limit=10,
-                    ),
-                )
-            for jws in resp.jobs_with_submissions:
-                subs_by_hk = {s.miner_hotkey: s for s in jws.submissions if s.s3_presigned_url}
-                jobs_map[jws.job.id] = (jws.job, subs_by_hk)
-        except Exception as e:
-            bt.logging.warning(f"UID:{uid} - OD validation: API fetch failed: {e}")
-            # Can't validate — don't reward blindly, don't penalize unfairly.
-            # Results are drained and lost; miner misses these rewards but
-            # isn't penalized.  Next cycle will validate fresh jobs.
-            return
-
-        validated_pass = 0
-        validated_fail = 0
-        skipped = 0
-
-        for r in jobs_to_validate:
-            job_data = jobs_map.get(r.job_id)
-            if not job_data:
-                skipped += 1
-                continue
-
-            job, subs_by_hk = job_data
-            submission = subs_by_hk.get(hotkey)
-            if not submission or not submission.s3_presigned_url:
-                skipped += 1
-                continue
-
-            passed = await self._validate_od_submission(uid, hotkey, job, submission, r)
-            if passed:
-                validated_pass += 1
-            else:
-                validated_fail += 1
-
-        # Apply rewards/penalties for ALL pending results based on validation outcome.
-        # If we validated a sample and ALL passed → reward everything.
-        # If ANY failed → penalize everything (miner is submitting garbage).
-        # If we couldn't validate any (all skipped) → give benefit of doubt,
-        # reward with reduced credibility bump.
-        actually_validated = validated_pass + validated_fail
-
-        if actually_validated > 0 and validated_fail > 0:
-            # At least one validation failed — penalize all pending
-            for r in pending_results:
-                self.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
-            bt.logging.warning(
-                f"UID:{uid} - HOTKEY:{hotkey}: OD validation FAILED "
-                f"({validated_fail}/{actually_validated} checked failed) — "
-                f"penalizing all {len(pending_results)} pending results"
-            )
-        elif actually_validated > 0 and validated_fail == 0:
-            # All validated submissions passed — reward everything
-            for r in pending_results:
-                self.scorer.apply_ondemand_reward(
-                    uid=uid,
-                    speed_multiplier=r.speed_multiplier,
-                    volume_multiplier=r.volume_multiplier,
-                )
-            bt.logging.info(
-                f"UID:{uid} - HOTKEY:{hotkey}: OD validation PASSED "
-                f"({validated_pass}/{actually_validated} checked) — "
-                f"rewarding all {len(pending_results)} pending results"
-            )
-        else:
-            # Couldn't validate any (jobs expired, presigned URLs gone, etc.)
-            # Don't reward blindly — results are lost.  The miner misses
-            # these rewards but will get validated on fresh jobs next cycle.
-            bt.logging.info(
-                f"UID:{uid} - HOTKEY:{hotkey}: OD validation skipped "
-                f"(0/{len(jobs_to_validate)} jobs available) — "
-                f"dropping {len(pending_results)} unvalidated results"
-            )
-
-        bt.logging.info(
-            f"UID:{uid} - HOTKEY:{hotkey}: OD summary — "
-            f"{len(pending_results)} pending (pass={validated_pass}, fail={validated_fail}, skip={skipped}), "
-            f"{len(failed_results)} empty penalized"
-        )
+        bt.logging.debug(f"UID:{uid} - HOTKEY:{hotkey}: OD evaluation placeholder (pending new API endpoint)")
 
     async def _validate_od_submission(
         self, uid: int, hotkey: str, job, submission, cached_result
