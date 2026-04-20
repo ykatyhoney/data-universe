@@ -106,8 +106,6 @@ class Validator:
         )
         bt.logging.info(f"Metagraph: {self.metagraph}.")
 
-        self.on_demand_validator = None
-
         # Event loop is thread-affine; will be created inside the validator run thread.
         self.loop = None
         self.axon = None
@@ -169,10 +167,8 @@ class Validator:
         else:
             bt.logging.warning("Axon off, not serving ip to chain.")
 
-        self.on_demand_validator = OnDemandValidator(evaluator=self.evaluator)
-
         # Wire OD validator into the evaluator for inline OD evaluation
-        self.evaluator.on_demand_validator = self.on_demand_validator
+        self.evaluator.on_demand_validator = OnDemandValidator(evaluator=self.evaluator)
 
         self.is_setup = True
 

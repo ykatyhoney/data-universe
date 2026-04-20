@@ -486,23 +486,27 @@ class MinerScorer:
                 f"OD cred: {old_od_cred:.4f} -> {new_od_cred:.4f}"
             )
 
-    def apply_ondemand_credibility_bump(self, uid: int) -> None:
-        """Small credibility bump for miners who submitted to an OD job but weren't sampled.
+    def apply_ondemand_credibility_bump(self, uid: int, count: int = 1) -> None:
+        """Small credibility bump for miners who submitted to OD jobs but weren't sampled.
 
         They participated (good signal) but we didn't verify their data,
         so we give a smaller credibility increase than a validated success.
+
+        Args:
+            uid: Miner UID.
+            count: Number of unsampled submissions to apply (batched, single lock).
         """
         with self.lock:
             old_od_cred = float(self.ondemand_credibility[uid])
-            # Half the normal alpha — participated but unverified
             alpha = MinerScorer.ONDEMAND_CRED_ALPHA * 0.5
-            self.ondemand_credibility[uid] = min(
-                1.0, alpha * 1.0 + (1 - alpha) * self.ondemand_credibility[uid]
-            )
+            for _ in range(count):
+                self.ondemand_credibility[uid] = min(
+                    1.0, alpha * 1.0 + (1 - alpha) * self.ondemand_credibility[uid]
+                )
             new_od_cred = float(self.ondemand_credibility[uid])
 
             bt.logging.trace(
-                f"OnDemand credibility bump (unsampled) for Miner {uid}: "
+                f"OnDemand credibility bump (unsampled ×{count}) for Miner {uid}: "
                 f"OD cred: {old_od_cred:.4f} -> {new_od_cred:.4f}"
             )
 

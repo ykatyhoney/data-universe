@@ -197,7 +197,7 @@ class ListMinerJobsForValidationRequest(BaseModel):
     expired_until: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
-    limit: int = Field(default=50, ge=1, le=100)
+    limit: int = Field(default=500, ge=1, le=1000)
 
 
 class MinerJobForValidation(BaseModel):
