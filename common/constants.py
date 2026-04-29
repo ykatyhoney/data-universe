@@ -45,6 +45,13 @@ X_ENHANCED_FORMAT_COMPATIBILITY_EXPIRATION_DATE = dt.datetime(2025, 9, 30, tzinf
 # Date after which scraped_at field is required on X and Reddit content
 SCRAPED_AT_REQUIRED_DATE = dt.datetime(2026, 3, 10, tzinfo=dt.timezone.utc)
 
+# Date after which uploaded parquet files must store scraped_at / scrapedAt
+# as a string (ISO format), not a parquet timestamp dtype. Files uploaded
+# before this date are grandfathered — miners cannot rewrite already-uploaded
+# parquet. Sampled files violating this post-deadline are dropped from
+# validation totals (size and row count).
+SCRAPED_AT_STRING_REQUIRED_DATE = dt.datetime(2026, 5, 6, tzinfo=dt.timezone.utc)
+
 EVALUATION_ON_STARTUP = 10
 
 # Emission Control / Burn Configuration
