@@ -3,6 +3,7 @@ import gc
 import copy
 import asyncio
 import datetime
+import json
 import random
 import traceback
 import threading
@@ -167,6 +168,16 @@ class MinerEvaluator:
 
         for j in empty:
             self.scorer.apply_ondemand_penalty(uid=uid, mult_factor=1.0)
+            bt.logging.info(json.dumps({
+                "event": "od_submission",
+                "uid": uid,
+                "hotkey": hotkey,
+                "job_id": j.submission.job_id,
+                "outcome": "empty_penalized",
+                "speed_mult": 0.0,
+                "volume_mult": 0.0,
+                "entity_count": 0,
+            }))
 
         if not non_empty:
             if empty:
@@ -180,7 +191,9 @@ class MinerEvaluator:
         to_validate = random.sample(
             non_empty, min(self.OD_MAX_JOBS_TO_VALIDATE, len(non_empty))
         )
-        not_sampled_count = len(non_empty) - len(to_validate)
+        sampled_ids = {id(j) for j in to_validate}
+        not_sampled = [j for j in non_empty if id(j) not in sampled_ids]
+        not_sampled_count = len(not_sampled)
 
         # Validate sampled jobs concurrently
         validation_results: List[Tuple[bool, int]] = await asyncio.gather(*[
@@ -207,13 +220,38 @@ class MinerEvaluator:
             if passed:
                 self.scorer.apply_ondemand_reward(uid, speed_mult, vol_mult)
                 validated_pass += 1
+                outcome = "validated_pass"
             else:
                 self.scorer.apply_ondemand_penalty(uid, mult_factor=1.0)
                 validated_fail += 1
+                outcome = "validated_fail"
+
+            bt.logging.info(json.dumps({
+                "event": "od_submission",
+                "uid": uid,
+                "hotkey": hotkey,
+                "job_id": j.submission.job_id,
+                "outcome": outcome,
+                "speed_mult": round(speed_mult, 4),
+                "volume_mult": round(vol_mult, 4),
+                "entity_count": entity_count,
+                "requested_limit": j.job.limit,
+                "upload_seconds": round(
+                    (j.submission.submitted_at - j.job.created_at).total_seconds(), 3
+                ) if j.submission.submitted_at and j.job.created_at else None,
+            }))
 
         # Batch credibility bump for non-sampled but participating submissions
         if not_sampled_count > 0:
             self.scorer.apply_ondemand_credibility_bump(uid, count=not_sampled_count)
+            for j in not_sampled:
+                bt.logging.info(json.dumps({
+                    "event": "od_submission",
+                    "uid": uid,
+                    "hotkey": hotkey,
+                    "job_id": j.submission.job_id,
+                    "outcome": "not_sampled_credibility_bump",
+                }))
 
         bt.logging.info(
             f"UID:{uid} - HOTKEY:{hotkey}: OD summary — "
