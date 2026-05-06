@@ -21,6 +21,41 @@ from vali_utils.on_demand.output_models import validate_metadata_completeness
 from vali_utils.metrics import ORGANIC_MINER_RESULTS
 
 
+# Reward multiplier tuning constants (see docs/od_reward_formula.md)
+SPEED_HALF_LIFE_S = 45.0
+VOLUME_SHORTFALL_EXPONENT = 1.3
+VOLUME_OVER_LOG_COEF = 0.15
+VOLUME_OVER_BONUS_CAP = 0.25
+VOLUME_OPEN_REF = 1000
+VOLUME_OPEN_MAX = 1.5
+
+
+def _speed_multiplier(upload_seconds: float) -> float:
+    """Half-life decay; clamps to [0, 1]. See docs/od_reward_formula.md §3."""
+    t = max(0.0, float(upload_seconds))
+    return min(1.0, 0.5 ** (t / SPEED_HALF_LIFE_S))
+
+
+def _volume_multiplier(returned: int, limit: Optional[int]) -> float:
+    """Sub-linear below target, log-capped over target. Open mode (limit=None)
+    grades absolute volume on log scale. See docs/od_reward_formula.md §4."""
+    r = max(0, int(returned or 0))
+    if r == 0:
+        return 0.0
+
+    if limit is None or limit <= 0:
+        denom = math.log10(1 + VOLUME_OPEN_REF)
+        return min(VOLUME_OPEN_MAX, math.log10(1 + r) / denom)
+
+    L = int(limit)
+    if r <= L:
+        return (r / L) ** VOLUME_SHORTFALL_EXPONENT
+
+    extra = (r - L) / L
+    bonus = min(VOLUME_OVER_BONUS_CAP, VOLUME_OVER_LOG_COEF * math.log(1.0 + extra))
+    return 1.0 + bonus
+
+
 @dataclass
 class ValidationContext:
     """Lightweight replacement for OrganicRequest (bt.Synapse) used only for validation."""
@@ -630,30 +665,15 @@ class OnDemandValidator:
         submission_timestamp: dt.datetime,
         returned_count: int,
         requested_limit: Optional[int],
-        consensus_count: Optional[float] = None,
     ) -> Tuple[float, float]:
-        # Speed multiplier (exponential decay)
-        if submission_timestamp is None or job_created_at is None:
+        if job_created_at is None or submission_timestamp is None:
             bt.logging.warning(
-                "Missing timestamp data for reward calculation, using default speed=0.5"
+                "Missing timestamp data for reward calculation, using default (0.5, 0.0)"
             )
-            speed_multiplier = 0.5
-        else:
-            upload_time_seconds = (
-                submission_timestamp - job_created_at
-            ).total_seconds()
-            decay_rate = 0.05
-            speed_multiplier = max(0.1, math.exp(-decay_rate * upload_time_seconds))
+            return 0.5, 0.0
 
-        # Volume multiplier
-        if requested_limit is None:
-            if consensus_count and consensus_count > 0:
-                volume_multiplier = min(1.0, returned_count / consensus_count)
-            else:
-                volume_multiplier = 1.0
-        elif returned_count == 0:
-            volume_multiplier = 0.0
-        else:
-            volume_multiplier = min(1.0, returned_count / requested_limit)
-
-        return speed_multiplier, volume_multiplier
+        upload_time_seconds = (submission_timestamp - job_created_at).total_seconds()
+        return (
+            _speed_multiplier(upload_time_seconds),
+            _volume_multiplier(returned_count, requested_limit),
+        )
