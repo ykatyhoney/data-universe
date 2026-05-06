@@ -9,7 +9,7 @@ from scraping import utils
 from scraping.scraper import ValidationResult
 from scraping.reddit.model import RedditContent, RedditDataType
 from common.data import DataEntity, DataLabel
-from common.constants import REDDIT_MEDIA_REQUIRED_DATE, SCRAPED_AT_REQUIRED_DATE
+from common.constants import REDDIT_MEDIA_REQUIRED_DATE
 
 
 def is_valid_reddit_url(url: str) -> bool:
@@ -34,13 +34,11 @@ def validate_scraped_at(
     now = dt.datetime.now(dt.timezone.utc)
 
     if content_to_validate.scraped_at is None:
-        if now >= SCRAPED_AT_REQUIRED_DATE:
-            return ValidationResult(
-                is_valid=False,
-                reason=f"scraped_at is required after {SCRAPED_AT_REQUIRED_DATE.isoformat()}",
-                content_size_bytes_validated=entity.content_size_bytes,
-            )
-        return None
+        return ValidationResult(
+            is_valid=False,
+            reason="scraped_at is required",
+            content_size_bytes_validated=entity.content_size_bytes,
+        )
 
     # Must be obfuscated to the minute
     if content_to_validate.scraped_at.second != 0 or content_to_validate.scraped_at.microsecond != 0:
