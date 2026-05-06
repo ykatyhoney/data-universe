@@ -256,13 +256,14 @@ class TestValidateScrapedAt(unittest.TestCase):
         self.assertFalse(result.is_valid)
         self.assertIn("future", result.reason)
 
-    def test_scraped_at_none_before_deadline(self):
-        """scraped_at=None is allowed before the deadline."""
+    def test_scraped_at_none_fails(self):
+        """scraped_at=None fails validation."""
         content, entity = self._make_content_and_entity(scraped_at=None)
         parsed = RedditContent.from_data_entity(entity)
         result = utils.validate_scraped_at(parsed, entity)
-        # Before the deadline this should return None (skip)
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        self.assertFalse(result.is_valid)
+        self.assertIn("required", result.reason)
 
     def test_scraped_at_equal_to_created_at(self):
         """scraped_at equal to created_at (obfuscated) is valid."""
