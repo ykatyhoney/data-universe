@@ -6,7 +6,7 @@ import bittensor as bt
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 from common.data import DataEntity
-from common.constants import NO_TWITTER_URLS_DATE, SCRAPED_AT_REQUIRED_DATE
+from common.constants import NO_TWITTER_URLS_DATE
 from scraping import utils
 from scraping.scraper import ValidationResult
 from scraping.x.model import XContent
@@ -289,13 +289,11 @@ def validate_scraped_at(
     now = dt.datetime.now(dt.timezone.utc)
 
     if tweet_to_verify.scraped_at is None:
-        if now >= SCRAPED_AT_REQUIRED_DATE:
-            return ValidationResult(
-                is_valid=False,
-                reason=f"scraped_at is required after {SCRAPED_AT_REQUIRED_DATE.isoformat()}",
-                content_size_bytes_validated=entity.content_size_bytes,
-            )
-        return None
+        return ValidationResult(
+            is_valid=False,
+            reason="scraped_at is required",
+            content_size_bytes_validated=entity.content_size_bytes,
+        )
 
     # Must be obfuscated to the minute
     if tweet_to_verify.scraped_at.second != 0 or tweet_to_verify.scraped_at.microsecond != 0:
