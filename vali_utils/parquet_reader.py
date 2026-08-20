@@ -132,8 +132,22 @@ def read_random_row_group(
         table = pf.read_row_group(rg_idx, columns=columns)
         df = table.to_pandas()
 
-        if max_rows and len(df) > max_rows:
-            df = df.drop_duplicates(subset=['url']).sample(n=min(max_rows, len(df)), random_state=r.randint(0, 2**31))
+        if max_rows and 'url' in df.columns:
+            # Dedup by URL BEFORE deciding the sample size, and always — not
+            # only when the group exceeds max_rows. The old form,
+            #   sample(n=min(max_rows, len(df)))  on the deduped frame,
+            # took n from the PRE-dedup length: a row group padded with
+            # duplicate URLs (few uniques, group-level dup share of a big file
+            # stays under the 1% within-job gate) made sample() raise, the
+            # broad except below returned None, and the caller silently
+            # skipped the file — a miner-craftable "unsampleable file". And a
+            # group with <= max_rows rows skipped dedup entirely, so copies of
+            # one real row could fill a caller's whole per-file quota.
+            df = df.drop_duplicates(subset=['url'])
+            if len(df) > max_rows:
+                df = df.sample(n=max_rows, random_state=r.randint(0, 2**31))
+        elif max_rows and len(df) > max_rows:
+            df = df.sample(n=max_rows, random_state=r.randint(0, 2**31))
 
         return df
 

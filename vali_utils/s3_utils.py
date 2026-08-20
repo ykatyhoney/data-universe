@@ -253,6 +253,13 @@ class DuckDBSampledValidator:
     # held to MIN_SCRAPER_SUCCESS on its own rather than in a combined rate.
     SCRAPER_PLATFORM_MIN_ENTITIES = 5
 
+    # Rows drawn from each file during the scraper phase. Small and FIXED, not
+    # proportional to the file's claimed rows: filling the entity pool then
+    # requires at least ceil(2 * num_entities / SCRAPER_ROWS_PER_FILE) DISTINCT
+    # files, which is what stops one oversized file from owning every
+    # scraper-checked entity. See _perform_scraper_validation.
+    SCRAPER_ROWS_PER_FILE = 5
+
     # File size limits - prevent empty file exploit and oversized file OOM
     MIN_FILE_SIZE_BYTES = 15_000                   # 15KB - empty parquet header ≈ 8KB
     MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024       # 1GB - single file cap
@@ -1930,39 +1937,45 @@ class DuckDBSampledValidator:
         """
         all_entities = []
 
-        # Row-weighted random ordering: each file's rank is exponential(weight=claimed
-        # rows), NOT bytes. Bytes track compression, not the scored quantity; a fab
-        # file that compresses small (~52 B/row) got few scraper rows under byte-share
-        # even though it claims the same rows as a real file. Files claiming more rows
-        # (which drive effective_size) come first on average; tiny files retain a real
-        # probability of inspection.
-        def _claimed_rows_for(f):
-            r = self._parse_row_count_from_filename(f.get('key', ''))
-            return r if r and r > 0 else 1
+        # UNIFORM random file order + a small FIXED per-file row quota.
+        #
+        # File *selection* is already row-weighted, and force-includes the top-5
+        # files by claimed rows (see validate_miner_s3_data), so the files that
+        # drive effective_size are guaranteed to be in `sampled_files` before we
+        # get here. Weighting a second time — a row-weighted order plus a
+        # row-proportional per-file budget — let the single largest file absorb
+        # the entire pool: at 20 rows/file the 40-row pool was full after two
+        # files, so all 20 validated entities came from one or two files of one
+        # platform. That is steerable on purpose: shrink the X jobs until Reddit
+        # holds nearly all claimed rows and the X leg is never scraper-checked
+        # at all, which also makes the per-platform bar vacuous (a platform with
+        # no entities in the pool has nothing to hold to MIN_SCRAPER_SUCCESS).
+        #
+        # Uniform over files with <= SCRAPER_ROWS_PER_FILE rows each needs at
+        # least 8 distinct files to fill the pool, so every sampled job has a
+        # real chance of contributing and the per-platform floor below has
+        # something to draw from. Large files keep their advantage where it is
+        # earned: they are far more likely to be *selected* in the first place.
+        sampled_files = list(sampled_files)
+        self._rng.shuffle(sampled_files)
 
-        file_weights = [_claimed_rows_for(f) for f in sampled_files]
-        ranked = _weighted_sample_without_replacement(
-            sampled_files, file_weights, len(sampled_files), rng=self._rng
-        )
-        sampled_files = ranked
+        # Pool target: twice the number of entities we finally validate, so the
+        # per-platform floor and the random draw below have slack to work with.
+        entity_pool_target = num_entities * 2
 
-        # Row-proportional per-file budget: a file holding 50% of the CLAIMED ROWS
-        # contributes ~50% of the rows we sample. Total entity budget is
-        # `num_entities * 2` (the existing pool-size target); allocate it pro-rata by
-        # claimed-row share so scraper effort tracks the effective_size claim.
-        sample_total_rows = max(sum(file_weights), 1)
-        entity_budget = num_entities * 2
-        MIN_ROWS_PER_FILE = 2
-        MAX_ROWS_PER_FILE = 20
-
-        def _rows_for_file(f):
-            share = _claimed_rows_for(f) / sample_total_rows
-            target = int(round(share * entity_budget))
-            return max(MIN_ROWS_PER_FILE, min(MAX_ROWS_PER_FILE, target))
+        # The quota is raised only when the sample holds too few files to fill
+        # the pool at the base rate — a small miner (fewer than 10 files in
+        # total) must not end up with a SMALLER scraper sample than before this
+        # change. It stays the same number for every file either way: what
+        # makes the draw unsteerable is that no file's share depends on the row
+        # count the miner declares, not the size of the share itself.
+        rows_per_file = self.SCRAPER_ROWS_PER_FILE
+        if sampled_files and len(sampled_files) * rows_per_file < entity_pool_target:
+            rows_per_file = math.ceil(entity_pool_target / len(sampled_files))
 
         for file_info in sampled_files:
 
-            if len(all_entities) >= num_entities * 2:
+            if len(all_entities) >= entity_pool_target:
                 break
 
             # Skip oversized files to prevent OOM
@@ -2022,10 +2035,11 @@ class DuckDBSampledValidator:
                 if required - available_cols:
                     continue
 
-                # Read 1 random row group; sample size scales with file's byte share.
+                # Read 1 random row group and draw a flat quota of random rows
+                # from it — same quota for every file, big or small.
                 df = read_random_row_group(
                     read_source, file_size,
-                    columns=None, max_rows=_rows_for_file(file_info),
+                    columns=None, max_rows=rows_per_file,
                     rng=self._rng
                 )
 
@@ -2107,7 +2121,14 @@ class DuckDBSampledValidator:
         # Fill the rest of the budget with a random draw over everything not yet picked.
         remaining = [it for it in all_entities if id(it) not in selected_ids]
         fill = max(0, target - len(selected))
-        selected.extend(self._rng.sample(remaining, min(fill, len(remaining))))
+        if fill > 0:
+            selected.extend(self._rng.sample(remaining, min(fill, len(remaining))))
+        else:
+            # The floors alone already over-subscribed the budget (enough
+            # platforms x SCRAPER_PLATFORM_MIN_ENTITIES > target). Shuffle
+            # before truncating so the platforms that survive the cut are drawn
+            # at random rather than by dict insertion order.
+            self._rng.shuffle(selected)
         entities_to_validate = selected[:target]
 
         sample_results = []

@@ -38,15 +38,32 @@ class TestS3QualityScoring(unittest.TestCase):
         scores = self.scorer.get_scores_for_weights()
         self.assertEqual(float(scores[uid]), 0.0)
 
-    def test_pass_ema_targets_observed_rate(self):
-        """16/20 must not pay like 20/20: credibility converges to 0.8, not 1.0."""
+    def test_pass_ema_targets_one_whatever_the_pass_rate(self):
+        """Passing is the signal; the observed rate must not grade it again.
+
+        MIN_SCRAPER_SUCCESS already refuses anything under 80% (per platform and
+        combined), so a reported pass means the sample cleared the bar. Grading
+        the EMA target by the rate on top of that made an honest 19/20 cycle —
+        one deleted post, one rate-limited lookup — pull credibility DOWN.
+        """
         uid = 0
         for _ in range(50):
             self.scorer.update_s3_effective_size(
-                uid, effective_size=1000.0, validation_passed=True, pass_rate=0.8
+                uid, effective_size=1000.0, validation_passed=True, pass_rate=0.95
             )
-        cred = float(self.scorer.s3_credibility[uid])
-        self.assertAlmostEqual(cred, 0.8, delta=0.001)
+        self.assertAlmostEqual(float(self.scorer.s3_credibility[uid]), 1.0, delta=0.001)
+
+    def test_pass_rate_is_telemetry_only(self):
+        """Two miners that both PASS end at the same credibility."""
+        graded, ungraded = 0, 1
+        for _ in range(10):
+            self.scorer.update_s3_effective_size(graded, 1000.0, True, pass_rate=0.8)
+            self.scorer.update_s3_effective_size(ungraded, 1000.0, True, pass_rate=1.0)
+        self.assertAlmostEqual(
+            float(self.scorer.s3_credibility[graded]),
+            float(self.scorer.s3_credibility[ungraded]),
+            places=6,
+        )
 
     def test_pass_without_scraper_sample_targets_one(self):
         uid = 0
@@ -83,21 +100,54 @@ class TestS3QualityScoring(unittest.TestCase):
         self.assertEqual(float(self.scorer.effective_sizes[uid]), 1000.0)
         self.assertLess(expected ** MinerScorer._CREDIBILITY_EXP, 0.03)
 
-    def test_prove_new_volume_scales_credibility(self):
-        """Doubling claimed size must scale cred by 0.5^(1/2.5) before the EMA,
-        so new volume earns nothing until it survives validation."""
+    def test_growth_does_not_scale_credibility(self):
+        """Doubling claimed size on a PASS must not tax the multiplier.
+
+        The S3 boost is capped at 2x OD before credibility (_s3_component), so
+        the extra volume cannot inflate the reward it feeds — scaling cred down
+        for it was a pure loss on new data.
+        """
         uid = 0
         self.scorer.update_s3_effective_size(uid, 1000.0, True, pass_rate=1.0)
         cred_before = float(self.scorer.s3_credibility[uid])
         alpha = self.scorer.s3_cred_alpha
 
         self.scorer.update_s3_effective_size(uid, 2000.0, True, pass_rate=1.0)
-        scaled = cred_before * (0.5 ** (1 / MinerScorer._CREDIBILITY_EXP))
-        expected = min(1.0, alpha * 1.0 + (1 - alpha) * scaled)
+        expected = min(1.0, alpha + (1 - alpha) * cred_before)
         self.assertAlmostEqual(float(self.scorer.s3_credibility[uid]), expected, places=5)
         self.assertEqual(float(self.scorer.effective_sizes[uid]), 2000.0)
 
-    def test_same_size_pass_has_no_prove_it_penalty(self):
+    def test_growth_and_flat_volume_reach_the_same_credibility(self):
+        grower, flat = 0, 1
+        size = 1000.0
+        for _ in range(20):
+            size *= 1.2  # keeps crawling and uploading, as the subnet asks
+            self.scorer.update_s3_effective_size(grower, size, True, pass_rate=1.0)
+            self.scorer.update_s3_effective_size(flat, 1000.0, True, pass_rate=1.0)
+        self.assertAlmostEqual(
+            float(self.scorer.s3_credibility[grower]),
+            float(self.scorer.s3_credibility[flat]),
+            places=6,
+        )
+        self.assertAlmostEqual(float(self.scorer.s3_credibility[grower]), 1.0, delta=0.01)
+
+    def test_capped_s3_component_never_grows_with_volume(self):
+        """The cap is why growth needs no credibility tax: past 2x OD, more
+        effective_size buys nothing, so it cannot be gamed for reward."""
+        uid = 0
+        self.scorer.ondemand_boosts[uid] = 100_000_000.0
+        self.scorer.ondemand_credibility[uid] = 1.0
+        self.scorer.s3_credibility[uid] = 1.0
+
+        self.scorer.update_s3_effective_size(uid, 1e12, True, pass_rate=1.0)
+        small = float(self.scorer.get_scores_for_weights()[uid])
+        self.scorer.update_s3_effective_size(uid, 1e15, True, pass_rate=1.0)
+        huge = float(self.scorer.get_scores_for_weights()[uid])
+
+        self.assertAlmostEqual(small, huge, delta=small * 1e-6)
+        self.assertAlmostEqual(huge, 3 * 100_000_000.0, delta=1.0)  # OD + 2xOD
+
+    def test_repeated_pass_climbs_toward_one(self):
         uid = 0
         self.scorer.update_s3_effective_size(uid, 1000.0, True, pass_rate=1.0)
         cred_before = float(self.scorer.s3_credibility[uid])
@@ -105,6 +155,7 @@ class TestS3QualityScoring(unittest.TestCase):
         self.scorer.update_s3_effective_size(uid, 1000.0, True, pass_rate=1.0)
         expected = min(1.0, alpha + (1 - alpha) * cred_before)
         self.assertAlmostEqual(float(self.scorer.s3_credibility[uid]), expected, places=5)
+        self.assertGreater(expected, cred_before)
 
 
 class TestPerPlatformBar(unittest.TestCase):

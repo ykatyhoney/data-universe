@@ -389,12 +389,28 @@ class MinerScorer:
         This rewards miners who have MORE data than others (squared advantage).
 
         FORGIVING APPROACH (like P2P credibility):
-        - On success: update effective_size; credibility EMAs toward the OBSERVED
-          scraper pass rate, not 1.0 — 16/20 and 20/20 no longer pay the same.
-          If claimed size grew, credibility is first scaled by
-          (old/new)^(1/_CREDIBILITY_EXP) (same "prove it" rule as P2P in
-          on_miner_evaluated) so new volume earns nothing until it survives
-          validation.
+        - On success: update effective_size and EMA credibility toward 1.0.
+          Passing IS the quality signal. validate_miner_s3_data only reports
+          is_valid=True when every gate held — combined scraper success >=
+          MIN_SCRAPER_SUCCESS, the same bar again per platform, job-content
+          match, dedup, and the structural checks. Grading the EMA target by
+          the observed pass rate on top of that gate charged a passing miner
+          twice for the same sample: 20 scraper lookups carry enough natural
+          noise (deleted posts, rate-limited or flaky third-party calls) that
+          19/20 is a normal honest cycle, yet it pushed credibility DOWN toward
+          0.95 and kept it there. The bar decides pass/fail; credibility tracks
+          how consistently the miner clears it.
+        - Claimed-size growth does NOT scale credibility down. The S3 boost is
+          already capped at 2x the OD component before credibility is applied
+          (see _s3_component), so extra volume cannot inflate the reward it
+          feeds. Taxing the multiplier for growth on top of that cap meant a
+          miner doing exactly what the subnet asks — crawling the desirability
+          list and uploading every cycle — lost S3 score for each upload while
+          the capped boost stayed flat: strictly negative return on new data,
+          before anything is known about whether it is real. The
+          (old/new)^(1/_CREDIBILITY_EXP) "prove it" rule stays where it belongs,
+          on P2P in on_miner_evaluated, where the score is NOT capped and grows
+          directly with claimed bytes.
         - On failure: KEEP previous effective_size, decrease credibility via EMA.
           Every detection type routes here, including structural ones: those
           depend on the validator reading the miner's parquet successfully, so a
@@ -406,7 +422,9 @@ class MinerScorer:
             effective_size: total_size_bytes × coverage² (calculated from current validation)
             validation_passed: Whether the miner passed quality validation
             pass_rate: Observed scraper pass fraction (0..1), or None if no
-                entities were scraper-validated this cycle
+                entities were scraper-validated this cycle. Telemetry only —
+                it is published to follower validators and logged, but it does
+                not move credibility; MIN_SCRAPER_SUCCESS already gates on it.
         """
         with self.lock:
             old_effective = float(self.effective_sizes[uid])
@@ -414,20 +432,12 @@ class MinerScorer:
 
             # Update S3 credibility based on validation result
             if validation_passed:
-                # "Prove new volume": growth in claimed size scales credibility
-                # down so the boost is unchanged until the new volume also
-                # passes validation (mirrors the P2P rule in on_miner_evaluated).
-                if old_effective > 0 and effective_size > old_effective:
-                    self.s3_credibility[uid] *= (old_effective / effective_size) ** (
-                        1 / MinerScorer._CREDIBILITY_EXP
-                    )
-                # Success: Update effective_size and move credibility toward the
-                # observed pass rate (1.0 when nothing was scraper-checked).
+                # Success: Update effective_size and increase credibility
+                # EMA toward 1.0: new_cred = alpha * 1.0 + (1-alpha) * old_cred
                 self.effective_sizes[uid] = effective_size
-                target = 1.0 if pass_rate is None else max(0.0, min(1.0, pass_rate))
                 self.s3_credibility[uid] = min(
                     1.0,
-                    self.s3_cred_alpha * target + (1 - self.s3_cred_alpha) * float(self.s3_credibility[uid]),
+                    self.s3_cred_alpha + (1 - self.s3_cred_alpha) * float(self.s3_credibility[uid]),
                 )
             else:
                 # Failure: KEEP previous effective_size, reduce credibility via EMA
@@ -452,7 +462,8 @@ class MinerScorer:
                 f"effective_size={new_effective/(1024*1024):.1f}MB (was {old_effective/(1024*1024):.1f}MB), "
                 f"s3_boost={float(self.s3_boosts[uid]):.0f}, "
                 f"s3_cred={new_cred:.4f} (was {old_cred:.4f}), "
-                f"passed={validation_passed}"
+                f"passed={validation_passed}, "
+                f"scraper_pass_rate={'n/a' if pass_rate is None else f'{pass_rate:.2f}'}"
             )
 
     def _recalculate_s3_boosts_internal(self) -> None:

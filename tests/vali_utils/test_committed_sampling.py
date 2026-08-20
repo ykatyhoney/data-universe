@@ -107,6 +107,50 @@ class TestSeededRowGroupRead(unittest.TestCase):
         self.assertEqual(out1['url'].tolist(), out2['url'].tolist())
         self.assertNotEqual(out1['url'].tolist(), out3['url'].tolist())
 
+    def test_duplicate_url_padding_cannot_make_a_file_unsampleable(self):
+        """A row group with fewer unique URLs than max_rows must return the
+        unique rows — not raise into the broad except and skip the file.
+
+        The old n=min(max_rows, len(pre-dedup)) made sample() raise here, so a
+        miner could pad one row group with duplicate URLs (group-level dup
+        share of a big file stays under the 1% within-job gate) and that file
+        silently escaped job-content matching and scraper validation."""
+        df = pd.DataFrame({
+            'url': [f'https://x.com/u/status/{i % 3}' for i in range(200)],
+            'text': [f'tweet {i}' for i in range(200)],
+        })
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, 'padded.parquet')
+            df.to_parquet(path, row_group_size=200)
+            out = read_random_row_group(path, 0, max_rows=5, rng=random.Random(1))
+        self.assertIsNotNone(out, "duplicate-URL padding silently skipped the file")
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out['url'].nunique(), 3)
+
+    def test_short_row_group_is_still_deduped(self):
+        """A group with <= max_rows rows used to skip dedup entirely, letting
+        copies of one real row fill the caller's whole per-file quota."""
+        df = pd.DataFrame({
+            'url': ['https://x.com/u/status/1'] * 4,
+            'text': ['tweet'] * 4,
+        })
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, 'short.parquet')
+            df.to_parquet(path, row_group_size=10)
+            out = read_random_row_group(path, 0, max_rows=5, rng=random.Random(1))
+        self.assertIsNotNone(out)
+        self.assertEqual(len(out), 1)
+
+    def test_frames_without_url_column_keep_plain_sampling(self):
+        df = pd.DataFrame({'text': [f'tweet {i}' for i in range(50)]})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, 'nourl.parquet')
+            df.to_parquet(path, row_group_size=50)
+            out = read_random_row_group(path, 0, columns=['text'],
+                                        max_rows=5, rng=random.Random(1))
+        self.assertIsNotNone(out)
+        self.assertEqual(len(out), 5)
+
 
 if __name__ == '__main__':
     unittest.main()
